@@ -1,0 +1,679 @@
+---
+title: "PseudoCode plus B4Screening 3 and 4"
+author: "Rebecca Mitchell"
+date: "July 23, 2018"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+
+```{r Reading in and generating Sample info, echo=FALSE}
+if (!require('reshape')) install.packages('reshape');packageVersion("reshape")
+if (!require('caret')) install.packages("caret"); packageVersion("caret")
+if (!require('caTools')) install.packages("caTools"); packageVersion("caTools")
+
+library("dada2"); packageVersion("dada2")
+library(dplyr); packageVersion("dplyr")
+library(ggplot2); packageVersion("ggplot2")
+library("phyloseq"); packageVersion("phyloseq")
+library(readr); packageVersion("readr")
+library(seqinr); packageVersion("seqinr")
+library(stringr); packageVersion("stringr")
+library(RColorBrewer); packageVersion("RColorBrewer")
+
+
+
+```
+#################LAB Data processing to develop classifier################################
+
+##import data
+##importing prinseq cleaned files into dada2
+```{r import prinseq cleaned data files, include=FALSE}
+
+##find all paths for fastq files
+paths=c("[pathway_to_files]")
+All<-dir(paths,recursive=TRUE, all.files=FALSE, pattern="Sample_",include.dirs = TRUE,full.names=TRUE)
+
+
+##keep only those fastq files with pre processing
+Prinseq1=sort(list.files(All, pattern="prinseq_1\\.fastq",full.names=TRUE, recursive=T))
+
+```
+#Processing Data
+
+Data from all plates were aggregated into a modified Bioconductor 16S pipeline. Reads were filtered, error rates were calculated and chimeras were removed using dada2.
+```{r dada2 data processing, include=FALSE}
+
+print(getwd())
+#Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs <- Prinseq1[,1]
+fnRs <- Prinseq2[,1]
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_prinseq"), `[`, 1)
+
+plotQualityProfile(fnFs[1:2])
+
+path=paths2
+filt_path <- file.path(path, "filtered") # Place filtered files in filtered/ subdirectory
+filtFs <- file.path(filt_path, paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(filt_path, paste0(sample.names, "_R_filt.fastq.gz"))
+
+#assign unique plate identity (assuming standard file name formats)
+Plate=gsub(".*?([A-Z]{3}[0-9]{4}).*$", "\\1", basename(fnFs))
+
+#process each plate and then create the combined sequence table
+for (i in 1:length(unique(as.factor(Plate)))){
+  PlateIndex=vector()
+  for (j in 1:length(fnFs)){
+    if (gsub(".*?([A-Z]{3}[0-9]{4}).*$", "\\1", basename(fnFs))[j]==unique(as.factor(Plate))[i]){
+      PlateIndex=c(PlateIndex,j)
+    }
+  }
+  fnFs1=fnFs[PlateIndex]
+  filtFs1=filtFs[PlateIndex]
+  fnRs1=fnRs[PlateIndex]
+  filtRs1=filtRs[PlateIndex]
+  out <- filterAndTrim(fnFs1, filtFs1, fnRs1, filtRs1,
+  maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+  compress=TRUE, multithread=TRUE) # On Windows set multithread=FALSE
+
+  errF <- learnErrors(filtFs1, multithread=TRUE, randomize=TRUE)
+  errR <- learnErrors(filtRs1, multithread=TRUE, randomize = TRUE)
+  plotErrors(errF, nominalQ=TRUE)
+  plotErrors(errR, nominalQ=TRUE)
+  derepFs <- derepFastq(filtFs1, verbose=TRUE)
+  derepRs <- derepFastq(filtRs1, verbose=TRUE)
+
+  # Name the derep-class objects by the sample names
+  names(derepFs) <- sample.names
+  names(derepRs) <- sample.names
+
+  dadaFs <- dada(derepFs, err=errF, multithread=TRUE, pool=TRUE)
+  dadaRs <- dada(derepRs, err=errR, multithread=TRUE,pool=TRUE)
+
+  dadaFs[[1]]
+  #head(out)
+
+  mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE)
+  # Inspect the merger data.frame from the first sample
+  head(mergers[[1]])
+
+  seqtab <- makeSequenceTable(mergers)
+
+  ## The sequences being tabled vary in length.
+
+  dim(seqtab)
+
+  ##Add the seqtab from each plate to the previous plate
+  if (!exists("seqtabAll")){
+    seqtabAll=seqtab
+  } else {
+    seqtabAll <- mergeSequenceTables(seqtabAll, seqtab)
+  }
+}
+
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtabAll)))
+seqtab.nochim <- removeBimeraDenovo(seqtabAll, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+
+
+
+saveRDS(seqtab.nochim, "seqtab.nochim.lab.rds")
+
+
+```
+##Editing
+
+Following processing in the dada2 pipeline to remove bimeras, B4Screening additional steps
+
+```{r B4Screening: Primer and probes step 3}
+
+##Keep only those sequences with matched primers on both ends. Allow 2 mismatches per 15 basepairs
+LookupL=vector()
+LookupR=vector()
+Primers=read.table("Malaria24SNP.txt", stringsAsFactors = FALSE)
+Probes=read.table("Probes.txt", header=TRUE, sep="\t")
+
+SeqLengths=as.numeric(summary(read.fasta("Malaria24SNPspecies.fasta"))[,1])
+
+
+#Separate and then reverse complement the primers as needed
+for (i in 1:dim(Primers)[1]){
+  LookupL[i]=strsplit(toupper(substr(Primers[i,1],1,15)),"")
+  LookupR[i]=strsplit(toupper(paste(rev(comp(unlist(strsplit(str_sub(Primers[i,1],-15,-1),"")))), sep="", collapse="")),"")
+}
+
+##identify best matched primer at each end of the read
+##tag for removal those reads without matched primers
+RemoveChimeras=vector()
+Match=vector()
+
+for (i in 1:dim(seqtab.nochim)[2]){
+  L_full=toupper(colnames(seqtab.nochim)[i])
+  L=strsplit(substr(L_full,1,15),"")
+  R_full= toupper(paste(rev(comp(unlist(strsplit(colnames(seqtab.nochim)[i],"")))),sep="",collapse=""))
+  R=strsplit(substr(R_full,1,15),"")
+  SeqLength=nchar(colnames(seqtab.nochim))[i]
+  l=0
+  r=0
+  lcount=0
+  rcount=0
+  if (nchar(colnames(seqtab.nochim)[i])>60){
+    for (j in 1:length(LookupL)){
+      if (sum(as.matrix(L[[1]])== as.matrix(LookupL[[j]]), na.rm=TRUE)>lcount){
+        l=j
+        lcount=sum(as.matrix(L[[1]])== as.matrix(LookupL[[j]]), na.rm=TRUE)
+      }
+      if(sum(as.matrix(R[[1]])== as.matrix(LookupR[[j]]), na.rm=TRUE)>rcount){
+        r=j
+        rcount=sum(as.matrix(R[[1]])== as.matrix(LookupR[[j]]), na.rm=TRUE)
+      }
+    }
+    if (l==r && lcount>=13 & rcount>=13){
+      ##require to be the right lengths
+      if (findInterval(SeqLength,c(SeqLengths[l]-1,SeqLengths[l]+1), rightmost.closed=TRUE)==1){
+        Probe1=min(adist(Probes[l,3],R_full,partial=TRUE),adist(Probes[l,3],L_full,partial=T))
+        Probe2=min(adist(Probes[l+24,3],R_full,partial=TRUE),adist(Probes[l+24,3],L_full,partial=T))
+        if (Probe1<Probe2){
+          Match=c(Match,"A")
+          RemoveChimeras=c(RemoveChimeras,i)
+        } else if (Probe1>Probe2){
+          Match=c(Match, "B")
+          RemoveChimeras=c(RemoveChimeras,i)
+        } else {
+          #  print("likely SNP location is not template")
+        }
+      }
+    }
+  }
+}
+
+
+seqtab.nochim1=(seqtab.nochim[,RemoveChimeras])
+
+
+```
+
+```{r accounting for removal during B4Screening step 3}
+
+
+#data loss stats
+track <- cbind(out[sapply(strsplit(rownames(out),"_",fixed=TRUE),function(i) paste(head(i,-2), collapse="_")) %in% rownames(seqtab.nochim),], rowSums(seqtab.nochim), rowSums(seqtab.nochim1))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered","bioconductor", "primer-based-pairs")
+head(track)
+
+
+seqtab.nochim2=seqtab.nochim1
+
+```
+
+Taxonomy was assigned to the amplicon level by assigning reference 3D7 sequence from each amplicon region as a 'species'.  The dataframe was generated including plate, ratio, mixture, preamplification status, parasite concentration and sample type. 
+
+```{r building parts to ps object}
+
+##assign ID to sections
+taxa <- assignTaxonomy(seqtab.nochim2, "Malaria24SNP.fasta", minBoot=80)
+taxa<-addSpecies(taxa,"Malaria24SNPspecies.fasta")
+taxa=cbind(taxa,Match)
+taxa.print <- taxa # Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+samples.out <- rownames(seqtab.nochim2)
+
+##Create the sample data table for the phyloseq object:
+
+samdf <- data.frame(plate=Plate,sampleid=SampleID,sampletype=SampleType,
+                    dose=Dose, preamp=PreAmp, ratio=Ratio, mix=Mix)
+
+rownames(samdf) <- samples.out
+
+```
+#Cleaning
+Following compilation of sample data with sequence data into a phyloseq object, we trained a KNN model using caret
+
+
+```{r visualizing}
+seqs <- getSequences(names(seqtab.nochim2[1,]))
+names(seqs) <- seqs # This propagates to the tip labels of the tree
+
+
+#We can now construct a phyloseq object directly from the dada2 outputs.
+sample_names(seqtab.nochim2) <- rownames(seqtab.nochim2)
+
+ps <- phyloseq(otu_table(seqtab.nochim2, taxa_are_rows=FALSE), 
+               sample_data(samdf), 
+               tax_table(taxa))
+
+#check step: remove any taxa with no entries
+zeroCountTaxa=names(taxa_sums(ps)[taxa_sums(ps)>0])
+ps = prune_taxa(zeroCountTaxa,ps)
+
+
+```
+
+
+##BinaryClassification based on rules to train ML models
+```{r Rule Based Assignment}
+#[Assign rule set here for your training data]
+#we required that 
+#1) the samples be present in at least 1/3 of the expected samples to be designated as "TRUE"
+#2) there be a linear relationship between expected concentration and observed concentration
+
+#saveRDS(Real, "Real.rds")
+```
+
+##Begin processing ps object
+```{r Processing ps for ML}
+
+#Extract otu_table information and taxa designation
+##Keep Sequence and Genus from tax table
+#Label for element remained in the training set as 'TRUE'
+##melt into Usable Format
+##meltOTU is the name used in this analysis.  
+
+meltOTU=melt(as.data.frame(otu_table(ps)),id.vars=c("MixRatio","ratio","mix","Plate","SampleID","Sample"))
+meltOTU$SNP=unlist(lapply(strsplit(as.character(meltOTU$variable),"_"),"[",1))
+meltOTU$ASV=unlist(lapply(strsplit(as.character(meltOTU$variable),"_"),"[",2))
+meltOTU$SNPno=as.numeric(gsub("SNP", "", meltOTU$SNP))  
+colnames(meltOTU)[7:8]<-c("SNP_ASV","ASVReadsBySample")  
+
+#Calculate characteristics:
+##1) get total by SNP in each sample
+##2) Count number of Reads by Sample:"ProportionAllASVReadsBySample"
+##3) Counts number of Reads with a SNP by Plate:"ReadsWithSNPbyPlate"
+##4) Merge OTU with SNPbySample SNPbyPlate ASVbyPlate AllReadsBySample
+##5) Calculate Proportion of all reads at a SNP are from one ASV on each plate (ProportionAllASVReadsByPlate)
+##6) Calculate Proportion of All reads at a SNP on a Plate are in each Sample (SampleSNPrepresentationOnPlate) 
+meltOTU1 #name after merging these aggregated numbers back into the dataset
+```
+
+
+##RF classifier in caret using your known dataset
+```{r classifier caTools caret}
+
+
+set.seed(101) 
+meltOTU1$Plate=as.factor(meltOTU1$Plate)
+#How many unique SNP-sample combinations represented?
+dim(unique(meltOTU1[c("SNP","SampleID")]))
+
+#Reserve 25% of data for testing
+train=sample(unique(meltOTU1$SampleID), round(.75*length(unique(meltOTU1$SampleID))))
+training  = meltOTU1[meltOTU1$SampleID %in% train,]
+testing = meltOTU1[!(meltOTU1$SampleID %in% train),]
+
+# ###
+set.seed(107)
+
+#train model
+trctrl <- trainControl(method = "repeatedcv", number = 10, repeats = 3)
+
+model_rf=train(training[,c("ProportionAllASVReadsBySample","ProportionAllASVReadsByPlate", "ReadsWithSNPbyPlate", "SampleSNPrepresentationOnPlate")],as.factor(training[,14]),trControl = trctrl,
+               tuneLength = 10)
+
+#test model
+prediction_rf=predict(object=model_rf,testing[,c("ProportionAllASVReadsBySample","ProportionAllASVReadsByPlate", "ReadsWithSNPbyPlate", "SampleSNPrepresentationOnPlate")])
+confusionMatrix(prediction_rf, as.factor(testing$Classifier))
+
+prediction_rflab=prediction_rf
+meltOTU1lab=meltOTU1
+psLab=ps
+
+
+###Silence to not overwrite
+saveRDS(model_rf,"model_rf.rds")
+```
+##########################################APPLYING CLASSIFIER: LAB and FIELD  ######################
+##The next chunks were run on the server but kept here to show what was actually run
+
+##import data
+```{r import Field Data following Prinseq, include=FALSE}
+print(getwd())
+
+##finding missing samples
+#paths2=c([pathway to prinseq output])
+All<-dir(paths2,recursive=TRUE, all.files=FALSE, pattern="Sample_",include.dirs = TRUE,full.names=TRUE)
+
+
+Prinseq1=sort(list.files(All, pattern="prinseq_1\\.fastq",full.names=TRUE, recursive=T))
+Prinseq1=cbind(Prinseq1,gsub(".*/","",Prinseq1))
+Prinseq1<-Prinseq1[!duplicated(Prinseq1[,2]),]
+
+Prinseq2=sort(list.files(All, pattern="prinseq_2\\.fastq",full.names=TRUE, recursive=T))
+Prinseq2=cbind(Prinseq2,gsub(".*/","",Prinseq2))
+Prinseq2<-Prinseq2[!duplicated(Prinseq2[,2]),]
+```
+#Processing Field Data
+
+```{r dada2 on Field include=FALSE}
+
+print(getwd())
+#Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs <- Prinseq1[,1]
+fnRs <- Prinseq2[,1]
+
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_prinseq"), `[`, 1)
+
+plotQualityProfile(fnFs[1:2])
+
+path=paths2
+filt_path <- file.path(path, "filtered") # Place filtered files in filtered/ subdirectory
+filtFs <- file.path(filt_path, paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(filt_path, paste0(sample.names, "_R_filt.fastq.gz"))
+Plate=gsub(".*?([A-Z]{3}[0-9]{4}).*$", "\\1", basename(fnFs))
+
+
+for (i in 1:length(unique(as.factor(Plate)))){
+  PlateIndex=vector()
+  for (j in 1:length(fnFs)){
+    if (gsub(".*?([A-Z]{3}[0-9]{4}).*$", "\\1", basename(fnFs))[j]==unique(as.factor(Plate))[i]){
+      PlateIndex=c(PlateIndex,j)
+    }
+  }
+  fnFs1=fnFs[PlateIndex]
+  filtFs1=filtFs[PlateIndex]
+  fnRs1=fnRs[PlateIndex]
+  filtRs1=filtRs[PlateIndex]
+  out <- filterAndTrim(fnFs1, filtFs1, fnRs1, filtRs1,
+                       maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+                       compress=TRUE, multithread=TRUE) # On Windows set multithread=FALSE
+  
+  errF <- learnErrors(filtFs1, multithread=TRUE, randomize=TRUE)
+  errR <- learnErrors(filtRs1, multithread=TRUE, randomize = TRUE)
+  plotErrors(errF, nominalQ=TRUE)
+  plotErrors(errR, nominalQ=TRUE)
+  derepFs <- derepFastq(filtFs1, verbose=TRUE)
+  derepRs <- derepFastq(filtRs1, verbose=TRUE)
+  
+  # Name the derep-class objects by the sample names
+  names(derepFs) <- sample.names
+  names(derepRs) <- sample.names
+  
+  dadaFs <- dada(derepFs, err=errF, multithread=TRUE, pool=TRUE)
+  dadaRs <- dada(derepRs, err=errR, multithread=TRUE,pool=TRUE)
+  
+  dadaFs[[1]]
+  #head(out)
+  
+  mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE)
+  # Inspect the merger data.frame from the first sample
+  head(mergers[[1]])
+  
+  seqtab <- makeSequenceTable(mergers)
+  
+  dim(seqtab)
+  
+  if (!exists("seqtabAll")){
+    seqtabAll=seqtab
+  } else {
+    seqtabAll <- mergeSequenceTables(seqtabAll, seqtab)
+  }
+}
+
+seqtab<- seqtabAll
+
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+
+
+```
+
+```{r Field B4Screening Step 3}
+
+##Keep only those sequences with matched primers on both ends. Allow 2 mismatches per 15 basepairs
+LookupL=vector()
+LookupR=vector()
+Primers=read.table("Malaria24SNP.txt", stringsAsFactors = FALSE)
+Probes=read.table("Probes.txt", header=TRUE, sep="\t")
+
+SeqLengths=as.numeric(summary(read.fasta("Malaria24SNPspecies.fasta"))[,1])
+
+for (i in 1:dim(Primers)[1]){
+  LookupL[i]=strsplit(toupper(substr(Primers[i,1],1,15)),"")
+  LookupR[i]=strsplit(toupper(paste(rev(comp(unlist(strsplit(str_sub(Primers[i,1],-15,-1),"")))), sep="", collapse="")),"")
+}
+RemoveChimeras=vector()
+Match=vector()
+for (i in 1:dim(seqtab.nochim)[2]){
+  L_full=toupper(colnames(seqtab.nochim)[i])
+  L=strsplit(substr(L_full,1,15),"")
+  R_full= toupper(paste(rev(comp(unlist(strsplit(colnames(seqtab.nochim)[i],"")))),sep="",collapse=""))
+  R=strsplit(substr(R_full,1,15),"")
+  SeqLength=nchar(colnames(seqtab.nochim))[i]
+  l=0
+  r=0
+  lcount=0
+  rcount=0
+  if (nchar(colnames(seqtab.nochim)[i])>60){
+    for (j in 1:length(LookupL)){
+      if (sum(as.matrix(L[[1]])== as.matrix(LookupL[[j]]), na.rm=TRUE)>lcount){
+        l=j
+        lcount=sum(as.matrix(L[[1]])== as.matrix(LookupL[[j]]), na.rm=TRUE)
+      }
+      if(sum(as.matrix(R[[1]])== as.matrix(LookupR[[j]]), na.rm=TRUE)>rcount){
+        r=j
+        rcount=sum(as.matrix(R[[1]])== as.matrix(LookupR[[j]]), na.rm=TRUE)
+      }
+    }
+    if (l==r && lcount>=13 & rcount>=13){
+      ##require to be the right lengths
+      if (findInterval(SeqLength,c(SeqLengths[l]-1,SeqLengths[l]+1), rightmost.closed=TRUE)==1){
+        Probe1=min(adist(Probes[l,3],R_full,partial=TRUE),adist(Probes[l,3],L_full,partial=T))
+        Probe2=min(adist(Probes[l+24,3],R_full,partial=TRUE),adist(Probes[l+24,3],L_full,partial=T))
+        if (Probe1<Probe2){
+          Match=c(Match,"A")
+          RemoveChimeras=c(RemoveChimeras,i)
+        } else if (Probe1>Probe2){
+          Match=c(Match, "B")
+          RemoveChimeras=c(RemoveChimeras,i)
+        } else {
+          #  print("likely SNP location is not template")
+        }
+      }
+    }
+  }
+}
+
+
+seqtab.nochim1=(seqtab.nochim[,RemoveChimeras])
+sum(seqtab.nochim1)/sum(seqtab.nochim)
+```
+
+
+Taxonomy was assigned to the amplicon level by assigning reference 3D7 sequence from each amplicon region as a 'species'.  The dataframe was generated including plate, ratio, mixture, preamplification status, parasite concentration and sample type. 
+
+```{r assign taxonomy and sample data Field}
+seqtab.nochim2=seqtab.nochim1
+taxa <- assignTaxonomy(seqtab.nochim2, "Malaria24SNP.fasta")
+taxa<-addSpecies(taxa,"Malaria24SNPspecies.fasta")
+taxa=cbind(taxa,Match)
+taxa.print <- taxa # Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+samples.out <- rownames(seqtab.nochim2)
+subject <- 
+  paste(sapply(strsplit(rownames(seqtab.nochim2), "_"), `[`, 3),sapply(strsplit(rownames(seqtab.nochim2), "_"), `[`, 2),sep="_")
+
+##Year is Opt1 or Opt2
+Opt1<-sapply(strsplit(rownames(seqtab.nochim2), "_"), `[`, 2)
+Opt2<-sapply(strsplit(rownames(seqtab.nochim2), "_"), `[`, 3)
+
+##Plate
+Plate=gsub(".*?([A-Z]{3}[0-9]{4}).*$", "\\1",rownames(seqtab.nochim2))
+
+SampleID <- subject #sapply(strsplit(basename(fnFs),"_prinseq"),'[',1)
+
+samdf <- data.frame(plate=Plate,sampleid=SampleID)
+rownames(samdf)<-samples.out
+```
+#Cleaning
+
+```{r ps from Field}
+
+#We can now construct a phyloseq object directly from the dada2 outputs.
+sample_names(seqtab.nochim2)<-rownames(seqtab.nochim2)
+psField <- phyloseq(otu_table(seqtab.nochim2, taxa_are_rows=FALSE), 
+               sample_data(samdf), 
+               tax_table(taxa))
+
+#saveRDS(ps,"psField.rds")
+```
+
+```{r reshape into format for B4Screening ML classifier step 4 FIELD}
+
+##Look within SNP on a sample basis
+Reads_Samples=as.data.frame(cbind(unname(colSums(otu_table(psField)!=0)),unname(taxa_sums(psField)), unname(tax_table(psField)[,6]),rownames(tax_table(psField))))
+colnames(Reads_Samples)[1:4]<-c("Samples","Reads","SNP","Sequence")
+
+##Keep Sequence and Genus from tax table
+SeqGen=as.data.frame(tax_table(psField)[,6])
+
+##Keep otu table from ps object
+otu_ps=as.data.frame(otu_table(psField))
+#Extract otu_table information and taxa designation
+##Keep Sequence and Genus from tax table
+#Label for element remained in the training set as 'TRUE'
+##melt into Usable Format
+meltOTU=melt(otu_ps,id.vars=c("Plate","SampleID","Sample"))
+#Calculate characteristics:
+##1) get total by SNP in each sample
+##2) Count number of Reads by Sample
+##3) Counts number of Reads with a SNP by Plate
+##4) Merge OTU with SNPbySample SNPbyPlate ASVbyPlate AllReadsBySample
+##5) Calculate Proportion of all reads at a SNP are from one ASV on each plate (ProportionAllASVReadsByPlate)
+##6) Calculate Proportion of All reads at a SNP on a Plate are in each Sample (SampleSNPrepresentationOnPlate) 
+
+#"ProportionAllASVReadsBySample","ProportionAllASVReadsByPlate", "ReadsWithSNPbyPlate", "SampleSNPrepresentationOnPlate
+meltOTU1field #is the name after implementing 1-6
+
+
+#saveRDS(meltOTU1,"meltOTU1field.rds")
+
+```
+
+
+#################CLASSIFY FIELD (same for re-RUNNING lab) #######################################
+
+```{r identifying the keep ASVs via the model B4Screening}
+prediction_rf=predict(object=model_rf,meltOTU1field[,c("ProportionAllASVReadsBySample","ProportionAllASVReadsByPlate", "ReadsWithSNPbyPlate", "SampleSNPrepresentationOnPlate")])
+
+meltOTU1field$Classifier=prediction_rf
+meltOTU2field=meltOTU1field[meltOTU1field$Classifier==TRUE,]
+##There are 67 unique ASVs from the field data
+
+ggsave("FieldClassifier1.pdf",print(ggplot(meltOTU1field, aes(x= log10(meltOTU1field$ReadsWithSNPbyPlate), y=log10(meltOTU1field$ReadsWithASVbyPlate) ,color=Classifier))+geom_point()+theme_bw()+ylab("Field Strain Reads with ASV by plate ")+xlab("Reads with SNP location by plate")),device="pdf")
+#dev.off()
+
+##Remove  the ASVs that aren't real from the ps object:
+KeepersLab=sort(as.numeric(unique(meltOTU2lab$ASV)))
+KeepLab=logical(length=length(colnames(otu_pslab)))
+KeepLab[KeepersLab]=TRUE
+psKeepLab=subset_taxa(psLab,KeepLab)
+
+```
+
+```{r getting proportion at each SNP by Probe Field}
+#```{r Stats for estimates}
+###We need to determine if it matches A or B better
+#Match is at ASV level
+##Add on 
+
+Values=matrix(,dim(otu_table(psKeepField))[1],24)
+AltReads=matrix(,dim(otu_table(psKeepField))[1],24)
+RefReads=matrix(,dim(otu_table(psKeepField))[1],24)
+for (j in 1:dim(otu_table(psKeepField))[1]){
+  ##HERE is the flexible coding
+  #for (i in 1:unique(as.vector(tax_table(psKeep)[,5]))){
+  ##HERE is the hard coding
+  for (i in 1:24){
+    ##rows with SNP
+    SNPindex=which(as.vector(tax_table(psKeepField)[,6])==paste("SNP",i,sep=""))
+    AorB=as.vector(tax_table(psKeepField)[SNPindex,8])
+    A=SNPindex[AorB=="A"]
+    B=SNPindex[AorB=="B"]
+    if (length(A)>0){
+      ReadsA=sum(otu_table(psKeepField)[j,A])
+    } else{
+      ReadsA=0
+    }
+    if (length(B)>0){
+      ReadsB=sum(otu_table(psKeepField)[j,B])
+      
+    } else {
+      ReadsB=0
+    }
+    if (sum(ReadsA,ReadsB)>500){
+      Values[j,i]=ReadsA/max((ReadsA+ReadsB),1)
+      AltReads[j,i]=ReadsB
+      RefReads[j,i]=ReadsA
+    }
+  }
+}
+rownames(Values)=rownames(otu_table(psKeepField))
+colnames(Values)=paste(rep("SNP", 24),1:24, sep="")
+
+rownames(AltReads)=rownames(otu_table(psKeepField))
+colnames(AltReads)=paste(rep("SNP", 24),1:24, sep="")
+
+rownames(RefReads)=rownames(otu_table(psKeepField))
+colnames(RefReads)=paste(rep("SNP", 24),1:24, sep="")
+
+
+```
+
+```{r Field remove those with viewer than 16 SNPS}
+AltReadsMelt=melt(AltReads,id=rownames(AltReads),varnames=c("Sample","SNP"))
+colnames(AltReadsMelt)[3]<-"AltReads"
+RefReadsMelt=melt(RefReads, id= rownames(RefReads),varnames=c("Sample","SNP"))
+colnames(RefReadsMelt)[3]<-"RefReads"
+AllReads=merge(AltReadsMelt,RefReadsMelt)
+AllReads=AllReads[(AllReads$AltReads+AllReads$RefReads)>0,]
+AllReads=AllReads[!is.na(AllReads$SNP),]
+AllReads$Tot=(AllReads$AltReads+ AllReads$RefReads)
+AllReads$PropRef=AllReads$RefReads/AllReads$Tot
+AllReads$SNP=factor(AllReads$SNP,
+                    levels = c(paste(rep("SNP",24),1:24,sep="")),ordered = TRUE)
+
+
+##ID SNPS to remove
+Nsnps=data.frame(table(AllReads$Sample)) ##lose only 4 samples
+
+Nsnps_to_Remove=Nsnps[Nsnps$Freq<16,]
+
+#Remove samples with fewer than 16 SNPs
+meltOTUlmField=AllReads[!(AllReads$Sample %in% Nsnps_to_Remove$Var1),]
+
+
+```
+
+##LONG TO WIDE
+```{r meltOTUlm long to wide field}
+
+#Remove samples with fewer than 16 SNPs
+meltOTUlmfield=AllReads[!(AllReads$Sample %in% Nsnps_to_Remove$Var1),]
+
+Frequencies=reshape(meltOTUlmfield[,c("Sample","SNP","PropRef")],idvar="Sample",timevar="SNP",direction="wide")
+
+##Keep year associated with frequencies
+FieldSampleData=as.data.frame.matrix(sample_data(psKeepField))
+#Substitute "Sample" for Sample_Year
+Frequencies$SampleYear=Frequencies$Sample
+
+Frequencies$Year=FieldSampleData$Year[match(unlist(Frequencies$SampleYear), rownames(FieldSampleData))]
+
+Frequencies$Sample=paste(Frequencies$Sample,unlist(Frequencies$Year), sep="_")
+colnames(Frequencies)<-gsub("PropRef.","",colnames(Frequencies))
+Frequencies=Frequencies[,c("Sample",paste("SNP",seq(1:24),sep=""))]
+
+#  write.csv(Frequencies,"T:/R_SNP/FrequenciesFieldcsv", row.names=FALSE)
+```
