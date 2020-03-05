@@ -11,12 +11,16 @@ If you use STIM, please cite the following paper:
 
 # Usage
 The first half of the pipeline, `screening.Rmd` is R pseudocode for the bioinformatics tools that are run on the raw 16S sequences. It generates the 24-SNP that are included in the `data/` folder.
+
 The second half of the pipeline is a series of self-contained Python scripts in the directory.
-To run, first create a virtual Python3 environment. Then run: `pip install -r requirements.txt`
-Next, each file is run by itself. 
-For example, `python3 stim-longitudinal.py` will generate a box-plot for the MOI evolution in western Kenya in the `figures/` folder.
 
+* To run, first create a virtual Python3 environment (optional). 
+* Then run: `pip install -r requirements.txt`
+* Next, each file is run by itself. 
+* For example, `python3 stim-longitudinal.py` will generate a box-plot for the MOI evolution in western Kenya in the `figures/` folder.
 
+# Contact
+Please contact corresponding author Ymir Vigfusson (ymir.vigfusson@emory.edu) with any questions about the software.
 
 
 
