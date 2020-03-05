@@ -20,6 +20,21 @@ from tqdm import tqdm,trange
 from strainpycon import StrainRecon
 
 
+def convert_name(inp):
+	# input: Sample_A1_NOPA_5_ZHO4076A1_1
+	if "MIT3556" in inp:
+		# Sample_A2_4NOPA_MIT3556A2.mat
+		out = re.sub (r'Sample_([ABC])([1-5])_([1-5])(\w+)_(\w+)', r'\1_\2\3\4_\5', inp)
+	else:
+		out = re.sub (r'Sample_([ABC])([1-5])_(\w+)_([1-5])_(\w+)', r'\1_\2\4\3_\5', inp)
+	out = re.sub (r'ZHO4076(.*)', 'BLO', out)
+	out = re.sub (r'ZHO5553(.*)', 'BLO', out)
+	out = re.sub (r'ZHO5019(.*)', 'DBS', out)
+	out = re.sub (r'MIT3556(.*)', 'DNA', out)
+	fields = re.search (r'([ABC])_([1-5])([1-5])(\w+)_(\w+)', out) 
+	return out,fields.groups()
+
+
 def infertruth(inp):
 	truth = { 'A' : [ "000010111111110100011011", "101111011000110111101011", "000111100010000010000000" ],
 	          'B' : [ "101111011000110111101011", "100101011111111100111111", "000010000010000001001000" ],
